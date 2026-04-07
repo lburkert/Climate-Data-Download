@@ -6,13 +6,9 @@
 
 
 # Source functions
-source("scripts/GetStationDataGeosphere_new/DataHubAccessFunctions.R")
+source("scripts/GetStationData_AT/DataHubAccessFunctions.R")
 
-############################################################
-# CONFIG - MODIFY ONLY THIS SECTION
-############################################################
-
-getStationData_AT <- function(bbox, start_date, end_date) {
+getStationData_AT <- function(bbox, start_date, end_date, netcdf_output) {
   
   start_date <- as.POSIXct(start_date, tz = "UTC")
   end_date   <- as.POSIXct(end_date,   tz = "UTC")
@@ -25,23 +21,14 @@ getStationData_AT <- function(bbox, start_date, end_date) {
   # Output directory
   out_dir <- "output/AT_klima_1h_by_station"
   
-  ############################################################
-  # PREPARATORY STEPS
-  ############################################################
-  
   # Create output directory
   dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
-  
-  # Added: keep both yearly and merged outputs
   yearly_dir <- file.path(out_dir, "yearly")
   merged_dir <- file.path(out_dir, "merged")
   dir.create(yearly_dir, showWarnings = FALSE, recursive = TRUE)
   dir.create(merged_dir, showWarnings = FALSE, recursive = TRUE)
   
-  ############################################################
-  # 1) Get station metadata and convert to EPSG:3416
-  ############################################################
-  
+  # Get station metadata and convert to EPSG:3416
   stations <- get_metadata(
     type        = "station",
     mode        = mode,
@@ -66,10 +53,7 @@ getStationData_AT <- function(bbox, start_date, end_date) {
   
   stations_3416 <- st_transform(stations_sf, 3416)
   
-  ############################################################
-  # 2) Build bbox polygon in EPSG:3416 and select stations
-  ############################################################
-  
+  # Build bbox polygon in EPSG:3416 and select stations
   inside <- st_within(stations_3416, bbox_poly_3416, sparse = FALSE)[, 1]
   stations_in_box <- stations_3416[inside, ]
   
@@ -82,7 +66,7 @@ getStationData_AT <- function(bbox, start_date, end_date) {
   message("Found ", length(station_ids), " station(s) in bbox: ",
           paste(station_ids, collapse = ", "))
   
-  # Added: station info lookup (coverage + name)
+  # station info lookup (coverage + name)
   station_info <- data.frame(
     id    = as.character(stations_in_box[[id_col]]),
     name  = as.character(stations_in_box[["Stationsname"]]),
@@ -91,49 +75,45 @@ getStationData_AT <- function(bbox, start_date, end_date) {
     stringsAsFactors = FALSE
   )
   
-  # Added: helper to get station name safely
+  # helper to get station name safely
   get_station_name <- function(sid) {
     x <- station_info$name[match(sid, station_info$id)]
     if (length(x) == 0 || is.na(x) || !nzchar(x)) return("NA")
     x
   }
   
-  # Added: make station names safe for filenames (no spaces, slashes, umlauts etc.)
+  # make station names safe for filenames (no spaces, slashes, umlauts etc.)
   make_safe_name <- function(x) {
-    x <- iconv(x, to = "ASCII//TRANSLIT")        # transliterate umlauts etc.
-    x <- gsub("[^A-Za-z0-9]+", "-", x)          # replace any non-alphanumeric with "-"
-    x <- gsub("-+", "-", x)                     # collapse multiple "-"
-    x <- gsub("^-|-$", "", x)                   # trim leading/trailing "-"
+    x <- iconv(x, to = "ASCII//TRANSLIT")        
+    x <- gsub("[^A-Za-z0-9]+", "-", x)
+    x <- gsub("-+", "-", x)
+    x <- gsub("^-|-$", "", x)
     if (!nzchar(x)) x <- "NA"
     x
   }
   
-  ############################################################
-  # 3) Loop over stations, download & save CSV per station
-  ############################################################
   
-  # Added: expected column names based on your example file
   time_col <- "time"
   sid_col  <- "station"
   
-  # Added: append CSV safely without rereading large files
+  # append CSV safely without rereading large files
   append_csv <- function(df, path) {
     dir.create(dirname(path), showWarnings = FALSE, recursive = TRUE)
     if (!file.exists(path)) {
       readr::write_csv(df, path)
     } else {
-      # Added: append without header (keeps existing file)
+      # append without header (keeps existing file)
       readr::write_csv(df, path, append = TRUE, col_names = FALSE)
     }
   }
   
-  # Added: parse time stamps robustly (works with ISO-like strings)
+  # parse time stamps robustly (works with ISO-like strings)
   parse_time_utc <- function(x) {
     # Try direct parsing; if it fails, return NA
     suppressWarnings(as.POSIXct(x, tz = "UTC"))
   }
   
-  # Added: update yearly files from newly downloaded rows only
+  # update yearly files from newly downloaded rows only
   update_yearly_files <- function(df_new, station_id) {
     if (!all(c(time_col, sid_col) %in% names(df_new))) return(invisible(NULL))
     
@@ -148,7 +128,7 @@ getStationData_AT <- function(bbox, start_date, end_date) {
       year_path <- file.path(yearly_dir, yy)
       dir.create(year_path, showWarnings = FALSE, recursive = TRUE)
       
-      # Added: include station name in yearly filenames: name_id_period
+      # include station name in yearly filenames: name_id_period
       sname <- get_station_name(station_id)
       safe_name <- make_safe_name(sname)
       
@@ -156,7 +136,7 @@ getStationData_AT <- function(bbox, start_date, end_date) {
       df_y_new <- split_list[[yy]]
       df_y_new$.__year <- NULL
       
-      # Added: keep yearly files clean (append + dedupe by time/station + overwrite)
+      # keep yearly files clean (append + dedupe by time/station + overwrite)
       if (file.exists(f_year)) {
         df_old <- tryCatch(readr::read_csv(f_year, show_col_types = FALSE), error = function(e) NULL)
         if (!is.null(df_old) && nrow(df_old) > 0) {
@@ -168,7 +148,7 @@ getStationData_AT <- function(bbox, start_date, end_date) {
         df_all <- df_y_new
       }
       
-      df_all[[time_col]] <- as.character(df_all[[time_col]])
+      # df_all[[time_col]] <- as.character(df_all[[time_col]])
       df_all[[sid_col]]  <- as.character(df_all[[sid_col]])
       df_all <- df_all[!duplicated(df_all[, c(time_col, sid_col)]), , drop = FALSE]
       
@@ -176,6 +156,22 @@ getStationData_AT <- function(bbox, start_date, end_date) {
       df_all <- df_all[order(tt_all), , drop = FALSE]
       
       readr::write_csv(df_all, f_year)
+      
+      #### optional NetCDF export ####
+      if (netcdf_output) {
+        
+        out_dir_netcdf <- file.path(out_dir, "netcdf_yearly")
+        dir.create(out_dir_netcdf, showWarnings = FALSE)
+        
+        year_folder_nc <- file.path(out_dir_netcdf, yy)
+        dir.create(year_folder_nc, showWarnings = FALSE, recursive = TRUE)
+        
+        df_all[[time_col]] <- as.POSIXct(df_all[[time_col]], tz = "UTC")
+        
+        out_file_nc <- file.path(year_folder_nc, paste0("AT_", sid, "_", safe_name, "_", yy, ".nc"))
+        
+        write_station_netcdf(df_all, sid, stations_in_box, out_file_nc)
+      }
     }
     
     invisible(NULL)
@@ -184,6 +180,7 @@ getStationData_AT <- function(bbox, start_date, end_date) {
   requested_start <- as.Date(start_date)
   requested_end   <- as.Date(end_date)
   
+  # download data for each station
   for (sid in station_ids) {
     
     sname <- get_station_name(sid)
@@ -196,13 +193,13 @@ getStationData_AT <- function(bbox, start_date, end_date) {
     effective_start <- max(requested_start, station_start, na.rm = TRUE)
     effective_end   <- min(requested_end, station_end, na.rm = TRUE)
     
-    # Added: skip if no overlap with the requested period
+    # skip if no overlap with the requested period
     if (is.na(effective_start) || is.na(effective_end) || effective_start > effective_end) {
       message("  ⚠️ No overlap with requested period (skipping).")
       next
     }
     
-    # Added: include station name in merged filename: name_id_period (canonical file per station)
+    # include station name in merged filename: name_id_period (canonical file per station)
     safe_name <- make_safe_name(sname)
     
     merged_file <- file.path(
@@ -210,7 +207,7 @@ getStationData_AT <- function(bbox, start_date, end_date) {
       paste0(resource_id, "_", safe_name, "_", sid, "_", start_date, "_", end_date, ".csv")
     )
     
-    # Added: incremental download - if merged file exists, continue after last timestamp
+    # incremental download - if merged file exists, continue after last timestamp
     if (file.exists(merged_file)) {
       last_time <- tryCatch({
         # Read only the time column to find the last timestamp
@@ -226,7 +223,7 @@ getStationData_AT <- function(bbox, start_date, end_date) {
       }
     }
     
-    # Added: after incremental shift, check overlap again
+    # after incremental shift, check overlap again
     if (is.na(effective_start) || effective_start > effective_end) {
       message("  ✅ Up to date (nothing new to download).")
       next
@@ -262,14 +259,31 @@ getStationData_AT <- function(bbox, start_date, end_date) {
       next
     }
     
-    # Added: write/append merged file
+    # write/append merged file
     append_csv(df_new, merged_file)
     message("  ✅ Updated merged: ", merged_file)
     
-    # Added: update yearly files based only on the new rows (keeps both products)
+    #### NetCDF export ####
+    if (netcdf_output) {
+      
+      out_dir_netcdf <- file.path(out_dir, "netcdf_merged")
+      dir.create(out_dir_netcdf, showWarnings = FALSE)
+      
+      df = fread(merged_file)
+      names(stations_in_box)[names(stations_in_box) == "id"] <- "Stations_id"
+      
+      df$time <- as.POSIXct(df$time, tz = "UTC")
+      
+      
+      out_file_nc <- file.path(out_dir_netcdf, paste0("AT_", sid, "_", safe_name, "_", start_date, "_", end_date, ".nc"))
+      
+      write_station_netcdf(df, sid, stations_in_box, out_file_nc)
+    }
+    
+    # update yearly files based only on the new rows (keeps both products)
     update_yearly_files(df_new, sid)
     message("  ✅ Updated yearly files for station ", sid, " (", sname, ")")
-  }
+    }
   
   message("Done. Files written to: ", normalizePath(out_dir))
   return(stations_in_box)

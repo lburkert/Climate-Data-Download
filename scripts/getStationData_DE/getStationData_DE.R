@@ -4,33 +4,40 @@
 #                                                                 #
 ###################################################################
 
-# Required packages:
-# sf, readr, dplyr, lubridate, zip, purrr, httr2, xml2, stringr
-
 # Source functions
 source("scripts/getStationData_DE/DWDAccessFunctions.R")
+source("scripts/df_to_netcdf.R")
 
-getStationData_DE <- function(bbox, start_date, end_date) {
+getStationData_DE <- function(bbox, start_date, end_date, netcdf_output) {
   
-  out_dir <- "output/dwd_station_data"
-  dir.create(out_dir, showWarnings = FALSE)
-  
+  # convert dates to dateformat
   start_date <- as.POSIXct(start_date, tz = "UTC")
   end_date   <- as.POSIXct(end_date,   tz = "UTC")
   
+  # get all stations that are available from DWD
   stationen_sf_3416 = getDWDStations()
   
+  # filter for stations in bbox
   stations_in_bbox <- stationen_sf_3416 %>%
     filter(st_within(geometry, bbox, sparse = FALSE))
   
-  # 2. Abbruch, wenn keine Stationen
+  # exit if no stations overlap with the bbox
   if (nrow(stations_in_bbox) == 0) {
-    message("→ Keine DWD-Stationen in der Bounding Box")
+    message("→ No DWD-Stations in Bounding Box")
     return(invisible(NULL))
   }
   
-  message("→ ", nrow(stations_in_bbox), " Stationen gefunden")
+  message("→ ", nrow(stations_in_bbox), " Stations found")
   
+  # create output directories
+  out_dir <- "output/DE_dwd_station_data/"
+  out_dir_merged <- "output/DE_dwd_station_data/merged/"
+  out_dir_yearly <- file.path(out_dir, "yearly")
+  dir.create(out_dir, showWarnings = FALSE)
+  dir.create(out_dir_merged, showWarnings = FALSE)
+  dir.create(out_dir_yearly, showWarnings = FALSE)
+  
+  # all the paths for the variables are set here (if new variables are added, this should be done here)
   DWD_VARS <- list(
     TU = list(
       base_url = "https://opendata.dwd.de/climate_environment/CDC/observations_germany/climate/hourly/air_temperature/historical/",
@@ -91,7 +98,7 @@ getStationData_DE <- function(bbox, start_date, end_date) {
     hit
   }
   
-  # Funktion für Datumskonvertierung
+  # function to convert date from character to date format
   convert_mess_datum <- function(x) {
     as.POSIXct(
       as.character(x),
@@ -118,7 +125,7 @@ getStationData_DE <- function(bbox, start_date, end_date) {
       zip_name <- find_zip(sid_raw, links, cfg$prefix)
       
       if (is.na(zip_name)) {
-        cat("  → keine Daten\n")
+        cat("  → No data available\n")
         next
       }
       
@@ -127,17 +134,17 @@ getStationData_DE <- function(bbox, start_date, end_date) {
       extract_dir <- file.path(out_dir, paste0("station_", sid))
       dir.create(extract_dir, showWarnings = FALSE)
       
-      # Download
+      # Download the data
       resp <- request(zip_url) |> req_timeout(60) |> req_perform()
       if (resp_status(resp) != 200) {
-        cat("  → Download fehlgeschlagen\n")
+        cat("  → Download failed\n")
         next
       }
       
       writeBin(resp_body_raw(resp), zip_file)
       unzip(zip_file, exdir = extract_dir)
       
-      # Produktdatei finden
+      # find product file
       txt_file <- list.files(
         extract_dir,
         pattern = cfg$product_pattern,
@@ -145,10 +152,11 @@ getStationData_DE <- function(bbox, start_date, end_date) {
       )
       
       if (length(txt_file) != 1) {
-        cat("  → Produktdatei fehlt\n")
+        cat("  → Product file not found\n")
         next
       }
       
+      # read downloaded file as df
       df <- read_delim(
         txt_file,
         delim = ";",
@@ -157,13 +165,14 @@ getStationData_DE <- function(bbox, start_date, end_date) {
         trim_ws = TRUE
       )
       
-      # --- Fehlwerte bereinigen (-999 zu NA) ---
+      # convert missing values from -999 to NA
       df <- df |> 
         mutate(across(where(is.numeric), ~na_if(., -999)))
       
-      # --- Datumskonvertierung und Upsampling ---
+      # convert date and updample snow height from daily to hourly
+      # snow height is treated differently since it is the only variable that is only recorded daily
       if (var == "SH") {
-        # 1. Datum als reines Tagesdatum einlesen
+        
         df <- df |>
           mutate(
             MESS_DATUM_DAY = as.Date(as.character(MESS_DATUM), format = "%Y%m%d")
@@ -174,28 +183,26 @@ getStationData_DE <- function(bbox, start_date, end_date) {
           )
         
         if (nrow(df) == 0) {
-          cat("  → keine Daten im Zeitraum\n")
+          cat("  → No data available in the requested timeframe\n")
           next
         }
         
-        # 2. Upsampling: Jede Zeile (Tag) in 24 Stunden expandieren
+        # 2. Upsampling: every daily value is split into 24 rows with the same value for snow height
         df <- df |>
           group_by(STATIONS_ID, MESS_DATUM_DAY) |>
           reframe(
-            # Wir bauen die Stunden nur für den aktuell gruppierten Tag
             MESS_DATUM = seq(
               from = as.POSIXct(paste(MESS_DATUM_DAY, "00:00:00"), tz = "UTC"),
               by   = "hour",
               length.out = 24
             ),
-            # Alle anderen Spalten (wie SHK_TAG) einfach wiederholen
             across(where(is.numeric), first)
           ) |>
           ungroup() |>
           select(-MESS_DATUM_DAY)
         
       } else {
-        # Normaler stündlicher Ablauf für TU, RR, FF, ST
+        # now all the other variables are filtered for the timeframe TU, RR, FF, ST
         df <- df |>
           mutate(
             MESS_DATUM = convert_mess_datum(MESS_DATUM)
@@ -206,33 +213,34 @@ getStationData_DE <- function(bbox, start_date, end_date) {
           )
       }
       
+      # checks if data is available for the requested timeframe
       if (nrow(df) == 0) {
-        cat("  → keine Daten im Zeitraum\n")
+        cat("  → No data available in the requested timeframe\n")
         next
       }
       
-      # Nur die Station id, das Messdatum und die Variabel wird ausgewählt
+      # selevt only the station id, the date and the requiered variables
       df_out <- df |> select(any_of(cfg$select_cols))
       
-      # Pfad für die output csv wird erstellt
+      # creates path for csv output
       out_csv <- file.path(
         extract_dir,
         paste0("station_", sid, "_", var, ".csv")
       )
       
-      # csv für station und variabel wird erstellt
+      # creates csv for each station and variable
       write_csv(df_out, out_csv)
-      cat("  → OK\n")
+      cat("  → CSV saved to ", out_csv, "\n")
     }
   }
   
-  # Funktion um für jede Station die Variablen in eine csv zu mergen
-  merge_station_vars <- function(station_id, base_dir = "dwd_station_data") {
+  # function to merge variables
+  merge_station_vars <- function(station_id, base_dir) {
     
     sid <- sprintf("%05d", as.integer(station_id))
     station_dir <- file.path(base_dir, paste0("station_", sid))
     
-    # --- TU als Basis ---
+    # temperature is used as the first var to create the df as it will most likely be available
     tu_file <- file.path(station_dir, paste0("station_", sid, "_TU.csv"))
     if (!file.exists(tu_file)) return(NULL)
     
@@ -241,17 +249,20 @@ getStationData_DE <- function(bbox, start_date, end_date) {
     
     df_all <- df_tu
     
-    # --- optionale Variablen ---
+    # all the other vars
     other_vars <- c("RR", "FF", "ST", "SH")
     
+    # adds the other vars to the df_all dataframe
     for (v in other_vars) {
       
       f <- file.path(station_dir, paste0("station_", sid, "_", v, ".csv"))
       if (!file.exists(f)) next
       
+      # reads the coresponding variable csv
       df_v <- read_csv(f, show_col_types = FALSE) |>
         distinct(STATIONS_ID, MESS_DATUM, .keep_all = TRUE)
       
+      # joins the variable column to the existing merged dataframe
       df_all <- left_join(
         df_all,
         df_v,
@@ -262,32 +273,102 @@ getStationData_DE <- function(bbox, start_date, end_date) {
     df_all
   }
   
-  
-  
-  
+  # applies the merging function
   for (sid in stations_in_bbox$Stations_id) {
     
-    df <- merge_station_vars(sid)
+    df <- merge_station_vars(sid, out_dir)
     if (is.null(df)) next
     
     station_name <- stations_in_bbox |>
       filter(Stations_id == sid) |>
       pull(Stationsname)
     
-    out_file <- file.path(
-      "dwd_station_data",
-      paste0("station_", 
-             sprintf("%05d", as.integer(sid)),
-             "_", 
-             station_name, 
-             "_merged.csv")
-    )
+    # rename colomns to match austrian naming sequence
+    cols_needed <- c("time","station","tl","rr","cglo","rf","ff","sh")
     
+    # rename column names to match geosphere variable names
+    df <- df |>
+      rename(
+        station = any_of("STATIONS_ID"),
+        time    = any_of("MESS_DATUM"),
+        tl      = any_of("TT_TU"),
+        rf      = any_of("RF_TU"),
+        ff      = any_of("F"),
+        cglo    = any_of("FG_LBERG"),
+        sh      = any_of("SHK_TAG"),
+        rr      = any_of("R1")
+      )
+    
+    # create NA columns for missing variables so all files have the same structure and dims 
+    missing_cols <- setdiff(cols_needed, names(df))
+    df[missing_cols] <- NA
+    
+    # change the order of the columns to match geosphere order
+    df <- df |> select(all_of(cols_needed))
+    
+
+    #create file path
+    out_file <- paste0(out_dir_merged, "station_", sprintf("%05d", as.integer(sid)), "_", station_name,
+                       "_", start_date, "_", end_date,".csv")
+
+    #write file
     write_csv(df, out_file)
+    
+    #### optional NetCDF export ####
+    if (netcdf_output) {
+      
+      out_dir_netcdf <- file.path(out_dir, "netcdf_merged")
+      dir.create(out_dir_netcdf, showWarnings = FALSE)
+      
+      out_file_nc <- file.path(out_dir_netcdf, paste0("DE_", sprintf("%05d", as.integer(sid)), "_", station_name, "_", start_date, "_", end_date, ".nc"))
+      
+      write_station_netcdf(df, sid, stations_in_bbox, out_file_nc)
+    }
+    
+    #### create yearly folders and files ####
+    df_yearly <- df |>
+      mutate(year = year(time))
+    
+    years <- unique(df_yearly$year)
+    
+    for (yr in years) {
+      
+      year_folder <- file.path(out_dir_yearly, yr)
+      dir.create(year_folder, showWarnings = FALSE, recursive = TRUE)
+      
+      df_y <- df_yearly |>
+        filter(year == yr) |>
+        select(-year)
+      
+      out_file_year <- paste0(year_folder, "/", "station_", sprintf("%05d", as.integer(sid)), "_", station_name, "_", yr, ".csv")
+      
+      write_csv(df_y, out_file_year)
+      
+      #### optional NetCDF export ####
+      if (netcdf_output) {
+        
+        out_dir_netcdf <- file.path(out_dir, "netcdf_yearly")
+        dir.create(out_dir_netcdf, showWarnings = FALSE)
+        
+        year_folder_nc <- file.path(out_dir_netcdf, yr)
+        dir.create(year_folder_nc, showWarnings = FALSE, recursive = TRUE)
+        
+        out_file_nc <- file.path(year_folder_nc, paste0("DE_", sprintf("%05d", as.integer(sid)), "_", station_name, "_", yr, ".nc"))
+        
+        write_station_netcdf(df_y, sid, stations_in_bbox, out_file_nc)
+      }
+    }
+    
   }
+  
+  # select raw unmerged station data for deletion
+  files <- list.files(out_dir, full.names = TRUE)
+  files_to_delete <- files[!basename(files) %in% c("merged", "yearly", "netcdf_merged", "netcdf_yearly")]
+  
+  # delete files that are no longer needed
+  unlink(files_to_delete, recursive = TRUE)
+  
   return(stations_in_bbox)
 }
-
-
 
 

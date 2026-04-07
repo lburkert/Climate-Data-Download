@@ -4,9 +4,6 @@
 #                                                             #
 ###############################################################
 
-# Required packages:
-# sf
-
 getDWDStations = function(){
   
   # 1. Define the URL
@@ -21,7 +18,7 @@ getDWDStations = function(){
   
   widths <- c(5, 9, 9, 15, 12, 10, 41, 41, 6)
   
-  # Datei einlesen
+  # read file
   stationen <- read_fwf(
     file = url,
     fwf_widths(widths, col_names = col_names),
